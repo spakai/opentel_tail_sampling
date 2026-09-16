@@ -6,7 +6,7 @@
 
 ### 1.1 Overview
 
-This system demonstrates tail-based sampling for a Java REST service. The application handles customer lookup and synthetic healthy, slow, and database-error requests. OpenTelemetry instrumentation sends all candidate traces to an OpenTelemetry Collector. The Collector decides which complete traces to retain and sends retained traces to Jaeger.
+This system demonstrates tail-based sampling for a Java REST service. The application handles customer lookup and synthetic healthy, slow, and database-error requests. OpenTelemetry instrumentation sends all candidate traces to an OpenTelemetry Collector. The Collector can either decide which complete traces to retain and send retained traces to Jaeger, or run in pass-through mode for comparison and memory testing.
 
 ### 1.2 Quality goals
 
@@ -31,6 +31,7 @@ This system demonstrates tail-based sampling for a Java REST service. The applic
 - OpenTelemetry Java agent version 2.21.0 instruments the application without source-level tracing code.
 - OpenTelemetry Collector Contrib version 0.123.0 performs tail sampling.
 - Jaeger all-in-one version 1.76.0 is used for local visualization.
+- `TAIL_SAMPLING_ENABLED` is selected through `compose.sh`; the official Collector image remains unchanged because it has no shell for in-container mode selection.
 - The current system is a demo: credentials, networking, storage, and TLS are not production-grade.
 
 ## 3. Context and Scope
@@ -67,12 +68,13 @@ customer-service -- OTLP traces --> OpenTelemetry Collector -- retained traces -
 ## 4. Solution Strategy
 
 1. Instrument the application at runtime with the OpenTelemetry Java agent.
-2. Use `always_on` at the application so the Collector sees complete candidate traces.
-3. Delay the sampling decision in the Collector until enough of each trace has arrived.
+2. Use `always_on` at the application so the Collector sees complete candidate traces in both modes.
+3. When enabled, delay the sampling decision in the Collector until enough of each trace has arrived.
 4. Retain traces with errors or latency above 5 seconds.
 5. Retain a very small probabilistic sample of healthy traces.
-6. Export retained traces to Jaeger for inspection.
-7. Keep the deployment small and reproducible with Docker Compose.
+6. When disabled, forward traces through memory limiting and batching without tail-sampling decisions.
+7. Export the selected output to Jaeger for inspection.
+8. Keep the deployment small and reproducible with Docker Compose.
 
 This strategy separates trace creation from retention policy. It avoids the fundamental limitation of head sampling, where a trace dropped at request start cannot be recovered after a later database failure.
 
@@ -84,7 +86,7 @@ This strategy separates trace creation from retention policy. It avoids the fund
 |---|---|---|
 | `customer-service` | Spring Boot, Java 21, embedded Tomcat | REST API, JDBC access, runtime instrumentation |
 | `postgres` | PostgreSQL 17 | Customer data and database fault/latency behavior |
-| `otel-collector` | OTel Collector Contrib 0.123.0 | OTLP intake, memory limiting, tail sampling, batching, export |
+| `otel-collector` | OTel Collector Contrib 0.123.0 | OTLP intake, selectable tail-sampling or pass-through processing, memory limiting, batching, export |
 | `jaeger` | Jaeger all-in-one 1.76.0 | Trace ingestion, in-memory storage, UI |
 
 ### 5.2 Level 2: customer-service internals
@@ -108,14 +110,21 @@ The controllers are intentionally small. Database calls are instrumented by the 
 ### 5.3 Collector internals
 
 ```text
-OTLP receiver
-    -> memory_limiter (512 MiB)
-    -> tail_sampling (10 s decision wait, 100,000 trace capacity)
-       -> status ERROR: keep
-       -> latency > 5,000 ms: keep
-       -> remaining traces: 0.01% probabilistic keep
-    -> batch
-    -> OTLP Jaeger exporter
+TAIL_SAMPLING_ENABLED=true:
+    OTLP receiver
+            -> memory_limiter (512 MiB)
+            -> tail_sampling (10 s decision wait, 100,000 trace capacity)
+                 -> status ERROR: keep
+                 -> latency > 5,000 ms: keep
+                 -> remaining traces: 0.01% probabilistic keep
+            -> batch
+            -> OTLP Jaeger exporter
+
+TAIL_SAMPLING_ENABLED=false:
+    OTLP receiver
+            -> memory_limiter (512 MiB)
+            -> batch
+            -> OTLP Jaeger exporter
 ```
 
 ## 6. Runtime View
@@ -174,7 +183,7 @@ Docker Compose network
 +------------------+       +------------------+
 ```
 
-The application waits for PostgreSQL's Compose health check. The Collector depends on Jaeger startup. The application depends on PostgreSQL health and Collector process startup.
+The application waits for PostgreSQL's Compose health check. The Collector depends on Jaeger startup. The application depends on PostgreSQL health and Collector process startup. `compose.sh` maps `TAIL_SAMPLING_ENABLED=true|false` to the corresponding mounted Collector configuration filename.
 
 The Dockerfile uses two stages: Maven/Eclipse Temurin 21 to compile and package, then Eclipse Temurin 21 JRE to run the jar with the OpenTelemetry agent.
 
@@ -182,7 +191,7 @@ The Dockerfile uses two stages: Maven/Eclipse Temurin 21 to compile and package,
 
 ### 8.1 Sampling
 
-Sampling is intentionally performed only after export from the application to the Collector. The application uses `always_on`; the Collector owns retention policy.
+Sampling is intentionally performed only after export from the application to the Collector. The application uses `always_on`; the Collector owns retention policy when tail sampling is enabled. In disabled mode, no Collector sampling decision is made and received traces continue through the pipeline.
 
 ### 8.2 Error and latency semantics
 
@@ -190,7 +199,7 @@ Database failures become application request failures and agent-recorded span er
 
 ### 8.3 Configuration
 
-Application and database settings are environment-driven. Collector policy is mounted from `otel-collector-config.yaml`. Image and dependency versions are explicitly specified in the Dockerfile, Compose file, and Maven descriptor.
+Application and database settings are environment-driven. The enabled Collector policy is mounted from `otel-collector-config.yaml`; the disabled pass-through policy is mounted from `otel-collector-config-no-tail-sampling.yaml`. `compose.sh` selects the config through `TAIL_SAMPLING_ENABLED`. Image and dependency versions are explicitly specified in the Dockerfile, Compose file, and Maven descriptor.
 
 ### 8.4 Data and storage
 
@@ -226,6 +235,12 @@ The demo has no authentication, authorization, TLS, secret manager integration, 
 
 **Reason:** Makes the example reproducible without requiring local PostgreSQL, Collector, or Jaeger installations.
 
+### ADR-5: Selectable Collector pipeline
+
+**Decision:** Keep separate enabled and disabled Collector configurations and select between them with `compose.sh`.
+
+**Reason:** The official Collector image is distroless and does not provide a shell for conditional startup logic. Separate static configurations make the mode change explicit, reviewable, and compatible with the image.
+
 ## 10. Quality Requirements
 
 - Build reproducibility from a clean checkout.
@@ -235,6 +250,8 @@ The demo has no authentication, authorization, TLS, secret manager integration, 
 - Healthy trace retention constrained to approximately 0.01%.
 - Trace continuity preserved when all spans reach one Collector instance.
 - Local smoke-test commands documented and repeatable.
+- Tail-sampling and pass-through modes can be started independently with the same application image.
+- Collector memory can be observed under identical generated request loads in both modes.
 
 ## 11. Risks and Technical Debt
 
@@ -245,6 +262,7 @@ The demo has no authentication, authorization, TLS, secret manager integration, 
 | No automated tests | regressions may be discovered late | add unit, integration, and Compose smoke tests |
 | Demo credentials and open ports | unauthorized access in shared environments | use secrets, TLS, and restricted networking |
 | Tail buffer sizing is static | memory pressure under load | load test and monitor Collector metrics |
+| Memory comparison is observational | small sequential samples do not establish capacity limits | repeat with concurrency and time-series metrics before sizing production |
 | Test endpoints are public | intentional failure behavior could be abused | remove or protect outside local demos |
 
 ## 12. Glossary
