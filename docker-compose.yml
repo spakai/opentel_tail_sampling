@@ -29,9 +29,10 @@ services:
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.123.0
-    command: ["--config=/etc/otelcol/config.yaml"]
+    command: ["--config=/etc/otelcol/${TAIL_SAMPLING_CONFIG:-config-tail-sampling.yaml}"]
     volumes:
-      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+      - ./otel-collector-config.yaml:/etc/otelcol/config-tail-sampling.yaml:ro
+      - ./otel-collector-config-no-tail-sampling.yaml:/etc/otelcol/config-no-tail-sampling.yaml:ro
     ports:
       - "4317:4317"
       - "4318:4318"
